@@ -9,21 +9,26 @@ Environment Variables:
            Example: "left:192.168.0.103,right:192.168.0.104"
 """
 
+import argparse
 import asyncio
+import os
+import sys
+import time
+from collections import deque
+
+import argcomplete
 import numpy as np
 import sounddevice as sd
-from scipy.fft import rfft, rfftfreq
+from dotenv import load_dotenv
 from kasa import Discover
-from collections import deque
-import argparse
-import sys
-import os
-import time
+from kasa.module import Module
+from scipy.fft import rfft, rfftfreq
 
+load_dotenv()
 # Audio settings
 SAMPLE_RATE = 44100
 CHUNK_SIZE = 2048  # ~46ms of audio
-UPDATE_RATE = 20   # Updates per second to bulbs
+UPDATE_RATE = 20  # Updates per second to bulbs
 
 # Frequency bands (Hz)
 BASS_RANGE = (20, 250)
@@ -96,7 +101,7 @@ class AudioAnalyzer:
         audio = audio * window
 
         fft_data = np.abs(rfft(audio))
-        freqs = rfftfreq(len(audio), 1/SAMPLE_RATE)
+        freqs = rfftfreq(len(audio), 1 / SAMPLE_RATE)
 
         def band_energy(low, high):
             mask = (freqs >= low) & (freqs <= high)
@@ -123,7 +128,12 @@ class ColorMapper:
         self.beat_count = 0
 
     def normalize(self, bands):
-        bass, mid, treble, energy = bands["bass"], bands["mid"], bands["treble"], bands["energy"]
+        bass, mid, treble, energy = (
+            bands["bass"],
+            bands["mid"],
+            bands["treble"],
+            bands["energy"],
+        )
         self.peak_bass = max(self.peak_bass * self.decay, bass, 0.01)
         self.peak_mid = max(self.peak_mid * self.decay, mid, 0.01)
         self.peak_treble = max(self.peak_treble * self.decay, treble, 0.01)
@@ -169,31 +179,47 @@ class ReactiveMapper(ColorMapper):
 
 
 class CalmMapper(ColorMapper):
-    """Calm mode - subtle, slow transitions, warm colors for studying."""
+    """Calm mode - slow, gradual, cool chill colors (blues, greens, cyans)."""
 
     def __init__(self):
         super().__init__()
-        self.hue = 30  # Start warm orange
-        self.target_hue = 30
+        # Cool color palette: greens (120), cyans (180), blues (210-240)
+        self.hue = 180  # Start cyan
+        self.target_hue = 180
+        self.saturation = 50
+        self.target_sat = 50
         self.brightness = 60
+        self.target_bright = 60
 
     def map_to_hsv(self, bands):
         n = self.normalize(bands)
-        self.detect_beat(n["bass"])  # Track but don't react dramatically
+        is_beat = self.detect_beat(n["bass"])
 
-        # Very slow hue drift based on overall energy
-        if n["energy"] > 0.3:
-            # Drift within warm spectrum (0-60: red to yellow)
-            self.target_hue = 20 + int(n["mid"] * 40)
+        # Gentle hue movement within cool spectrum (90-250: green to blue)
+        # Bass pulls toward deeper blues, treble toward greens/cyans
+        base_hue = 170  # Center around cyan
+        freq_influence = (n["treble"] - n["bass"]) * 60  # ±60 degrees
+        self.target_hue = base_hue + freq_influence + (n["mid"] * 30)
 
-        # Smooth transition (very slow)
-        self.hue += (self.target_hue - self.hue) * 0.02
+        # Clamp to cool spectrum (90-250)
+        self.target_hue = max(90, min(250, self.target_hue))
 
-        # Subtle brightness variation
-        target_bright = 50 + int(n["energy"] * 20)
-        self.brightness += (target_bright - self.brightness) * 0.05
+        # On beats, gently shift toward a complementary cool color
+        if is_beat:
+            self.target_hue = 90 + ((self.target_hue - 90 + 80) % 160)
 
-        return int(self.hue) % 360, 60, int(self.brightness), False
+        # Very smooth transitions (slow lerp)
+        self.hue += (self.target_hue - self.hue) * 0.03
+
+        # Saturation: lower when calm, slightly higher with energy
+        self.target_sat = 35 + int(n["energy"] * 35)  # 35-70%
+        self.saturation += (self.target_sat - self.saturation) * 0.05
+
+        # Brightness: gentle pulsing with music
+        self.target_bright = 45 + int(n["energy"] * 25) + int(n["bass"] * 15)
+        self.brightness += (self.target_bright - self.brightness) * 0.04
+
+        return int(self.hue) % 360, int(self.saturation), int(self.brightness), False
 
 
 class RaveMapper(ColorMapper):
@@ -250,6 +276,12 @@ class BulbController:
         if not self.bulbs:
             raise RuntimeError("No bulbs connected!")
 
+    async def disconnect(self):
+        """Properly close all bulb connections."""
+        for name, bulb in self.bulbs.items():
+            await bulb.protocol.close()
+        self.bulbs.clear()
+
     async def turn_on_all(self):
         for name, bulb in self.bulbs.items():
             await bulb.turn_on()
@@ -260,11 +292,16 @@ class BulbController:
             return
 
         last = self.last_hsv[name]
-        if abs(hue - last[0]) < 5 and abs(saturation - last[1]) < 5 and abs(brightness - last[2]) < 5:
+        if (
+            abs(hue - last[0]) < 5
+            and abs(saturation - last[1]) < 5
+            and abs(brightness - last[2]) < 5
+        ):
             return
 
         try:
-            await self.bulbs[name].set_hsv(hue, saturation, brightness)
+            light = self.bulbs[name].modules[Module.Light]
+            await light.set_hsv(hue, saturation, brightness)
             self.last_hsv[name] = (hue, saturation, brightness)
         except Exception as e:
             print(f"Error setting {name}: {e}", file=sys.stderr)
@@ -289,7 +326,7 @@ def list_audio_devices():
     print("-" * 50)
     devices = sd.query_devices()
     for i, dev in enumerate(devices):
-        if dev['max_input_channels'] > 0:
+        if dev["max_input_channels"] > 0:
             marker = " <-- (default)" if i == sd.default.device[0] else ""
             print(f"  [{i}] {dev['name']}{marker}")
     print("-" * 50)
@@ -299,26 +336,20 @@ def list_audio_devices():
 
 async def run_white_mode(controller, brightness: int, color_temp: str):
     """Static warm white light mode."""
-    # Warm white: low saturation, warm hue
-    # Color temp: warm (2700K-ish) = hue ~30, sat ~30
-    # Cool would be hue ~200, sat ~20
-    if color_temp == "warm":
-        hue, sat = 30, 30
-    elif color_temp == "cool":
-        hue, sat = 200, 20
-    else:  # neutral
-        hue, sat = 60, 15
+    # Color temperatures from cool to warm
+    temps = {
+        "cool2": (210, 25),   # Daylight blue
+        "cool1": (180, 20),   # Cool white
+        "neutral": (60, 15),  # Neutral white
+        "warm1": (35, 30),    # Warm white
+        "warm2": (25, 40),    # Candlelight
+    }
+    hue, sat = temps.get(color_temp, temps["neutral"])
 
     print(f"\nWhite mode: {color_temp}, brightness {brightness}%")
-    print("Press Ctrl+C to stop.\n")
-
     await controller.set_all_hsv(hue, sat, brightness)
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        print("\nStopping...")
+    await controller.disconnect()
+    print("Done!")
 
 
 async def run_visualization(controller, analyzer, mapper, color_mode: str):
@@ -340,18 +371,21 @@ async def run_visualization(controller, analyzer, mapper, color_mode: str):
             hue, sat, bright, is_beat = mapper.map_to_hsv(bands)
 
             beat_indicator = " BEAT!" if is_beat else ""
-            print(f"\rHue: {hue:3d} | Sat: {sat:3d} | Bright: {bright:3d} | "
-                  f"Beats: {mapper.beat_count:4d}{beat_indicator:6s}",
-                  end="", flush=True)
+            print(
+                f"\rHue: {hue:3d} | Sat: {sat:3d} | Bright: {bright:3d} | "
+                f"Beats: {mapper.beat_count:4d}{beat_indicator:6s}",
+                end="",
+                flush=True,
+            )
 
             now = time.time()
             time_since_update = now - last_update
             hue_change = abs(hue - last_hue)
 
             should_update = (
-                time_since_update > 0.15 or
-                is_beat or
-                (hue_change > 30 and time_since_update > 0.08)
+                time_since_update > 0.15
+                or is_beat
+                or (hue_change > 30 and time_since_update > 0.08)
             )
 
             if should_update:
@@ -369,6 +403,7 @@ async def run_visualization(controller, analyzer, mapper, color_mode: str):
         print("\n\nStopping...")
     finally:
         analyzer.stop()
+        await controller.disconnect()
         print(f"Done! Total beats detected: {mapper.beat_count}")
 
 
@@ -386,23 +421,42 @@ Modes:
 Examples:
   %(prog)s --mode reactive --device 2
   %(prog)s --mode calm
-  %(prog)s --mode white --brightness 80 --color-temp warm
+  %(prog)s --mode white --brightness 80 --color-temp warm1
   %(prog)s --mode rave --color-mode complementary
 
 Environment:
   Set BULBS='left:192.168.0.103,right:192.168.0.104' before running.
-"""
+""",
     )
-    parser.add_argument("--list-devices", action="store_true", help="List audio input devices")
+    parser.add_argument(
+        "--list-devices", action="store_true", help="List audio input devices"
+    )
     parser.add_argument("--device", type=int, help="Audio input device index")
-    parser.add_argument("--mode", choices=["reactive", "calm", "rave", "white"], default="reactive",
-                       help="Visualization mode")
-    parser.add_argument("--color-mode", choices=["sync", "complementary"], default="sync",
-                       help="Color mode: sync (same) or complementary (opposite)")
-    parser.add_argument("--brightness", type=int, default=80, help="Brightness for white mode (1-100)")
-    parser.add_argument("--color-temp", choices=["warm", "neutral", "cool"], default="warm",
-                       help="Color temperature for white mode")
-    parser.add_argument("--test", action="store_true", help="Test mode: cycle through colors")
+    parser.add_argument(
+        "--mode",
+        choices=["reactive", "calm", "rave", "white"],
+        default="reactive",
+        help="Visualization mode",
+    )
+    parser.add_argument(
+        "--color-mode",
+        choices=["sync", "complementary"],
+        default="sync",
+        help="Color mode: sync (same) or complementary (opposite)",
+    )
+    parser.add_argument(
+        "--brightness", type=int, default=80, help="Brightness for white mode (1-100)"
+    )
+    parser.add_argument(
+        "--color-temp",
+        choices=["cool2", "cool1", "neutral", "warm1", "warm2"],
+        default="warm1",
+        help="Color temperature for white mode (cool2=daylight, warm2=candlelight)",
+    )
+    parser.add_argument(
+        "--test", action="store_true", help="Test mode: cycle through colors"
+    )
+    argcomplete.autocomplete(parser)
     args = parser.parse_args()
 
     if args.list_devices:
@@ -430,6 +484,7 @@ Environment:
             print(f"  Hue: {hue}")
             await controller.set_all_hsv(hue, 100, 100)
             await asyncio.sleep(1)
+        await controller.disconnect()
         print("Test complete!")
         return
 
