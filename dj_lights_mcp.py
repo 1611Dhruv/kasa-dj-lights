@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 import sounddevice as sd
+from kasa import Discover
 from mcp.server.fastmcp import FastMCP
 
 from dj_lights import (
@@ -55,20 +56,63 @@ class AppState:
     current_settings: dict = field(default_factory=dict)
 
 
+async def _discover_kasa_bulbs() -> dict[str, str]:
+    """Discover Kasa bulbs on the local network. Returns {name: ip} dict."""
+    devices = await Discover.discover()
+    bulbs = {}
+    for ip, dev in devices.items():
+        await dev.update()
+        # Use the device alias as the name, cleaned up for use as a key
+        alias = dev.alias.strip()
+        # Convert "Bulb Left" -> "left", "Bulb Right" -> "right", etc.
+        name = alias.lower().replace("bulb ", "").replace(" ", "_")
+        if not name:
+            name = f"bulb_{len(bulbs) + 1}"
+        bulbs[name] = str(ip)
+    return bulbs
+
+
+async def _connect_bulbs(state: AppState, bulb_ips: dict[str, str]) -> bool:
+    """Try to connect to bulbs. Returns True on success."""
+    state.controller = BulbController(bulb_ips)
+    try:
+        await state.controller.connect()
+        await state.controller.turn_on_all()
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to connect to bulbs: {e}")
+        state.controller = None
+        return False
+
+
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[AppState]:
-    """Connect to bulbs on startup, disconnect on shutdown."""
+    """Connect to bulbs on startup, disconnect on shutdown.
+
+    Tries configured BULBS env var first. If that fails or isn't set,
+    falls back to auto-discovery on the local network.
+    """
     state = AppState()
 
     bulb_ips = parse_bulbs_env()
+    connected = False
+
+    # Try configured IPs first
     if bulb_ips:
-        state.controller = BulbController(bulb_ips)
+        connected = await _connect_bulbs(state, bulb_ips)
+
+    # Fallback to auto-discovery
+    if not connected:
+        print("Auto-discovering Kasa bulbs on the network...")
         try:
-            await state.controller.connect()
-            await state.controller.turn_on_all()
+            discovered = await _discover_kasa_bulbs()
+            if discovered:
+                print(f"Discovered bulbs: {discovered}")
+                connected = await _connect_bulbs(state, discovered)
+            else:
+                print("No Kasa bulbs found on the network.")
         except Exception as e:
-            print(f"Warning: Failed to connect to bulbs: {e}")
-            state.controller = None
+            print(f"Discovery failed: {e}")
 
     try:
         yield state
@@ -87,7 +131,10 @@ mcp = FastMCP(
     instructions=(
         "Control TP-Link Kasa smart bulbs with real-time music visualization. "
         "Use set_mode to start visualizations, set_color for manual colors, "
-        "and get_status to check the current state."
+        "and get_status to check the current state. "
+        "If any tool returns an error about bulbs not being connected or not responding, "
+        "call reconnect to auto-discover and reconnect to bulbs on the network. "
+        "You can also use discover_bulbs to scan for available bulbs without reconnecting."
     ),
     lifespan=lifespan,
 )
@@ -323,6 +370,66 @@ async def test_colors() -> str:
 
     state.current_mode = "idle"
     return json.dumps({"status": "ok", "action": "test_complete"})
+
+
+# ── Discovery / Reconnection Tools ────────────────────────────────────
+
+
+@mcp.tool()
+async def discover_bulbs() -> str:
+    """Scan the local network for Kasa smart bulbs. Use this if bulbs aren't responding or IPs have changed."""
+    try:
+        discovered = await _discover_kasa_bulbs()
+    except Exception as e:
+        return json.dumps({"error": f"Discovery failed: {e}"})
+
+    if not discovered:
+        return json.dumps({"bulbs": [], "message": "No Kasa bulbs found on the network."})
+
+    return json.dumps({"bulbs": [{"name": n, "ip": ip} for n, ip in discovered.items()]})
+
+
+@mcp.tool()
+async def reconnect() -> str:
+    """Reconnect to bulbs. Tries configured BULBS env var first, then auto-discovers on the network.
+
+    Use this if bulbs stopped responding, IPs changed, or the initial connection failed.
+    """
+    ctx = mcp.get_context()
+    state: AppState = ctx.request_context.lifespan_context
+
+    # Stop any running visualization
+    await _stop_current(state)
+
+    # Disconnect existing controller
+    if state.controller:
+        try:
+            await state.controller.disconnect()
+        except Exception:
+            pass
+        state.controller = None
+
+    # Try configured IPs first
+    bulb_ips = parse_bulbs_env()
+    if bulb_ips:
+        if await _connect_bulbs(state, bulb_ips):
+            names = list(state.controller.bulbs.keys())
+            return json.dumps({"status": "ok", "method": "configured", "bulbs": names})
+
+    # Fallback to auto-discovery
+    try:
+        discovered = await _discover_kasa_bulbs()
+    except Exception as e:
+        return json.dumps({"error": f"Discovery failed: {e}"})
+
+    if not discovered:
+        return json.dumps({"error": "No Kasa bulbs found on the network."})
+
+    if await _connect_bulbs(state, discovered):
+        names = list(state.controller.bulbs.keys())
+        return json.dumps({"status": "ok", "method": "auto_discovered", "bulbs": names})
+
+    return json.dumps({"error": "Found bulbs but failed to connect."})
 
 
 # ── Info / Status Tools ───────────────────────────────────────────────
