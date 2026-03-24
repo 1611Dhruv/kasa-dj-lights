@@ -130,8 +130,11 @@ def get_album_artwork():
 
 
 def generate_analogous_colors(base_hue, base_sat, count=4):
-    """Generate analogous colors (similar shades) based on a base hue."""
-    colors = [(base_hue, base_sat)]
+    """Generate analogous colors (similar shades) based on a base hue.
+
+    Returns (hue, sat, value) tuples with value=1.0 (full brightness).
+    """
+    colors = [(base_hue, base_sat, 1.0)]
 
     # Analogous colors are close on the color wheel (30-45° apart)
     offsets = [30, -30, 60, -60, 45, -45]
@@ -139,13 +142,18 @@ def generate_analogous_colors(base_hue, base_sat, count=4):
     for i, offset in enumerate(offsets):
         if len(colors) >= count:
             break
-        colors.append(((base_hue + offset) % 360, base_sat))
+        colors.append(((base_hue + offset) % 360, base_sat, 1.0))
 
     return colors[:count]
 
 
 def extract_dominant_colors(image_path, num_colors=5):
-    """Extract dominant colors from image, return as (hue, saturation) tuples."""
+    """Extract dominant colors from image, return as (hue, saturation, value) tuples.
+
+    Value represents the brightness of the original color - when value is very low
+    (black/dark colors), the light brightness should be set to 0.
+    Black colors are only included if the image is predominantly dark.
+    """
     try:
         img = Image.open(image_path)
         img = img.convert('RGB')
@@ -154,57 +162,47 @@ def extract_dominant_colors(image_path, num_colors=5):
         # Get pixel data
         pixels = np.array(img).reshape(-1, 3)
 
-        # Filter out very dark pixels (they don't make good light colors)
-        brightness = pixels.mean(axis=1)
-        pixels = pixels[brightness > 30]
-
         if len(pixels) < num_colors:
-            # Not enough pixels, generate colors
-            return generate_analogous_colors(200, 70, 4)  # Default blue-ish
+            # Not enough pixels, use default palette
+            return [(200, 70, 1.0), (230, 70, 1.0), (260, 70, 1.0)]
 
         # K-means clustering to find dominant colors
         kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init=10)
         kmeans.fit(pixels)
         colors = kmeans.cluster_centers_
 
-        # Convert RGB to HSV and check if image is grayscale
-        hsv_colors = []
-        total_saturation = 0
+        # Convert RGB to HSV
+        color_data = []
         for r, g, b in colors:
             h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
-            hsv_colors.append((h, s, v))
-            total_saturation += s
+            hue = int(h * 360)
+            # Boost saturation for visibility (unless it's a dark/black color)
+            sat = max(60, int(s * 100)) if v > 0.2 else int(s * 100)
+            color_data.append((hue, sat, v))
 
-        avg_saturation = total_saturation / len(hsv_colors)
+        # Calculate average brightness to determine if image is predominantly dark
+        avg_brightness = sum(v for _, _, v in color_data) / len(color_data)
+        is_dark_image = avg_brightness < 0.3
 
-        # If average saturation is very low, image is grayscale
-        # Generate a nice palette instead of using meaningless hue values
-        if avg_saturation < 0.15:
-            # Grayscale album - use a cool blue/purple palette
-            return generate_analogous_colors(220, 70, 4)
+        # Only include black colors (v < 0.2) if the image is predominantly dark
+        if is_dark_image:
+            # Keep all colors including black
+            filtered = color_data
+        else:
+            # Filter out dark colors - only keep bright/colorful ones
+            filtered = [(h, s, v) for h, s, v in color_data if v >= 0.2]
 
-        # Extract colors with meaningful saturation
-        color_data = []
-        for h, s, v in hsv_colors:
-            if v > 0.2 and s > 0.1:  # Filter by brightness and minimum saturation
-                hue = int(h * 360)
-                sat = max(60, int(s * 100))  # Boost saturation for visibility
-                color_data.append((hue, sat))
+        # Sort by value descending (brighter first)
+        filtered = sorted(filtered, key=lambda x: -x[2])
 
-        # If we didn't get enough colorful colors, generate from what we have
-        if len(color_data) < 3:
-            if len(color_data) >= 1:
-                # Use the first extracted color as base
-                base_hue, base_sat = color_data[0]
-                color_data = generate_analogous_colors(base_hue, max(70, base_sat), 4)
-            else:
-                # No colorful colors found, use a nice default
-                color_data = generate_analogous_colors(220, 70, 4)
+        # If we filtered everything out, use a default palette
+        if not filtered:
+            return [(200, 70, 1.0), (230, 70, 1.0), (260, 70, 1.0)]
 
-        return sorted(color_data, key=lambda x: x[0])  # Sort by hue
+        return filtered
     except Exception as e:
         print(f"Error extracting colors: {e}", file=sys.stderr)
-        return generate_analogous_colors(220, 70, 4)  # Fallback
+        return [(200, 70, 1.0), (230, 70, 1.0), (260, 70, 1.0)]  # Fallback
 
 
 def list_app_windows(app_name="Google Chrome"):
@@ -478,10 +476,10 @@ class AlbumReactiveMapper(ColorMapper):
 
     def __init__(self, color_palette=None, sensitivity=1.0, max_brightness=100):
         super().__init__(sensitivity, max_brightness)
-        # Color palette stores (hue, sat) tuples
-        self.color_palette = color_palette or [(0, 70), (120, 70), (240, 70)]
+        # Color palette stores (hue, sat, value) tuples - value indicates if color is dark/black
+        self.color_palette = color_palette or [(0, 70, 1.0), (120, 70, 1.0), (240, 70, 1.0)]
         self.current_color_index = 0
-        self.hue_base, self.sat_base = self.color_palette[0]
+        self._unpack_current_color()
         self.last_track_check = 0
         self.current_track = None
 
@@ -499,13 +497,24 @@ class AlbumReactiveMapper(ColorMapper):
         self.is_beatdrop = False
         self.beatdrop_intensity = 0
 
+    def _unpack_current_color(self):
+        """Unpack current color from palette, handling both 2-tuple and 3-tuple formats."""
+        color = self.color_palette[self.current_color_index]
+        if len(color) == 3:
+            self.hue_base, self.sat_base, self.value_base = color
+        else:
+            # Legacy 2-tuple format (hue, sat) - assume full brightness
+            self.hue_base, self.sat_base = color
+            self.value_base = 1.0
+        self.is_black_color = self.value_base < 0.2
+
     def update_palette(self, new_palette):
         """Update color palette (called when track changes)."""
         if new_palette and len(new_palette) > 0:
             self.color_palette = new_palette
             # Reset index to 0 when palette changes (avoids IndexError)
             self.current_color_index = 0
-            self.hue_base, self.sat_base = self.color_palette[0]
+            self._unpack_current_color()
             # Reset vibe when track changes
             self.energy_history.clear()
             self.song_vibe = 0.5
@@ -560,7 +569,7 @@ class AlbumReactiveMapper(ColorMapper):
             # Hype songs: change color on every beat
             if n["energy"] > (0.4 - self.song_vibe * 0.2):
                 self.current_color_index = (self.current_color_index + 1) % len(self.color_palette)
-                self.hue_base, self.sat_base = self.color_palette[self.current_color_index]
+                self._unpack_current_color()
 
         # Detect beatdrop with adaptive threshold
         self.is_beatdrop = self.detect_beatdrop(self.song_vibe)
@@ -594,6 +603,11 @@ class AlbumReactiveMapper(ColorMapper):
         self.current_sat += ((target_sat - self.current_sat) * 0.08)
 
         # === BRIGHTNESS === Adaptive to vibe
+        # If current color is black, set brightness to 0 for accuracy
+        if self.is_black_color:
+            self.current_bright = 0
+            return int(self.current_hue), int(self.current_sat), 0, is_beat
+
         base_bright = 45 + int(n["energy"] * 20)
         bass_influence = int(n["bass"] * 20 * self.song_vibe)  # Scale bass impact by vibe
 
@@ -1051,7 +1065,7 @@ async def run_visualization(
                     current_track = track_info["track"]
                     print(f"Album colors from: {track_info['track']} - {track_info['artist']}")
                     # Format colors nicely
-                    colors_str = ", ".join([f"H:{h}° S:{s}%" for h, s in color_data])
+                    colors_str = ", ".join([f"H:{h}° S:{s}% V:{v:.0%}" for h, s, v in color_data])
                     print(f"Color palette: {colors_str}\n")
 
         while True:
@@ -1071,7 +1085,7 @@ async def run_visualization(
                     if artwork_path:
                         color_data = extract_dominant_colors(artwork_path)
                         mapper.update_palette(color_data)
-                        colors_str = ", ".join([f"H:{h}° S:{s}%" for h, s in color_data])
+                        colors_str = ", ".join([f"H:{h}° S:{s}% V:{v:.0%}" for h, s, v in color_data])
                         print(f"New color palette: {colors_str}\n")
 
             bands = analyzer.get_frequency_bands()
