@@ -3,15 +3,14 @@
 DJ Lights - Real-time music visualization for Kasa smart bulbs.
 Captures audio, analyzes frequencies via FFT, and maps them to colors.
 
-Environment Variables:
-    BULBS - Comma or colon separated list of bulb IPs
-           Format: "name1:ip1,name2:ip2" or just "ip1,ip2"
-           Example: "left:192.168.0.103,right:192.168.0.104" """
+Lights are auto-discovered on the network, or can be specified via BULBS env var.
+"""
 
 import argparse
 import asyncio
 import colorsys
 import os
+import readline
 import shlex
 import subprocess
 import sys
@@ -20,25 +19,14 @@ import time
 from collections import deque
 from pathlib import Path
 
-# Try to use gnureadline for better macOS support, fall back to readline
-try:
-    import gnureadline as readline
-except ImportError:
-    import readline
-
-import argcomplete
 import mss
 import numpy as np
 import Quartz
 import sounddevice as sd
-from dotenv import load_dotenv
 from kasa import Discover
 from kasa.module import Module
 from PIL import Image
 from scipy.fft import rfft, rfftfreq
-from sklearn.cluster import KMeans
-
-load_dotenv()
 # Audio settings
 SAMPLE_RATE = 44100
 CHUNK_SIZE = 2048  # ~46ms of audio
@@ -51,24 +39,18 @@ TREBLE_RANGE = (2000, 8000)
 
 
 def parse_bulbs_env():
-    """Parse BULBS environment variable into a dict of name:ip pairs."""
+    """Parse BULBS environment variable into a dict of name:ip pairs (fallback if auto-discovery isn't used)."""
     env_val = os.environ.get("BULBS", "")
     if not env_val:
-        print("Warning: BULBS environment variable not set!")
-        print("Set it like: export BULBS='left:192.168.0.103,right:192.168.0.104'")
-        print("Or just IPs: export BULBS='192.168.0.103,192.168.0.104'")
         return {}
 
     bulbs = {}
-    # Split by comma
     parts = [p.strip() for p in env_val.split(",") if p.strip()]
     for i, part in enumerate(parts):
         if ":" in part:
-            # Format: name:ip
             name, ip = part.split(":", 1)
             bulbs[name.strip()] = ip.strip()
         else:
-            # Just IP, auto-name
             bulbs[f"bulb{i+1}"] = part.strip()
     return bulbs
 
@@ -145,66 +127,40 @@ def generate_analogous_colors(base_hue, base_sat, count=4):
 
 
 def extract_dominant_colors(image_path, num_colors=5):
-    """Extract dominant colors from image, return as (hue, saturation) tuples."""
+    """Extract dominant colors from image using PIL quantization (no sklearn needed)."""
     try:
-        img = Image.open(image_path)
-        img = img.convert('RGB')
-        img = img.resize((150, 150))  # Resize for faster processing
+        img = Image.open(image_path).convert("RGB").resize((150, 150))
+        quantized = img.quantize(colors=num_colors, method=Image.Quantize.MEDIANCUT)
+        palette = quantized.getpalette()[: num_colors * 3]
 
-        # Get pixel data
-        pixels = np.array(img).reshape(-1, 3)
-
-        # Filter out very dark pixels (they don't make good light colors)
-        brightness = pixels.mean(axis=1)
-        pixels = pixels[brightness > 30]
-
-        if len(pixels) < num_colors:
-            # Not enough pixels, generate colors
-            return generate_analogous_colors(200, 70, 4)  # Default blue-ish
-
-        # K-means clustering to find dominant colors
-        kmeans = KMeans(n_clusters=num_colors, random_state=42, n_init=10)
-        kmeans.fit(pixels)
-        colors = kmeans.cluster_centers_
-
-        # Convert RGB to HSV and check if image is grayscale
         hsv_colors = []
         total_saturation = 0
-        for r, g, b in colors:
-            h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
+        for i in range(0, len(palette), 3):
+            r, g, b = palette[i], palette[i + 1], palette[i + 2]
+            h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
             hsv_colors.append((h, s, v))
             total_saturation += s
 
-        avg_saturation = total_saturation / len(hsv_colors)
+        avg_saturation = total_saturation / max(len(hsv_colors), 1)
 
-        # If average saturation is very low, image is grayscale
-        # Generate a nice palette instead of using meaningless hue values
+        # Grayscale image — generate a nice palette instead
         if avg_saturation < 0.15:
-            # Grayscale album - use a cool blue/purple palette
             return generate_analogous_colors(220, 70, 4)
 
-        # Extract colors with meaningful saturation
         color_data = []
         for h, s, v in hsv_colors:
-            if v > 0.2 and s > 0.1:  # Filter by brightness and minimum saturation
-                hue = int(h * 360)
-                sat = max(60, int(s * 100))  # Boost saturation for visibility
-                color_data.append((hue, sat))
+            if v > 0.2 and s > 0.1:
+                color_data.append((int(h * 360), max(60, int(s * 100))))
 
-        # If we didn't get enough colorful colors, generate from what we have
         if len(color_data) < 3:
-            if len(color_data) >= 1:
-                # Use the first extracted color as base
-                base_hue, base_sat = color_data[0]
-                color_data = generate_analogous_colors(base_hue, max(70, base_sat), 4)
-            else:
-                # No colorful colors found, use a nice default
-                color_data = generate_analogous_colors(220, 70, 4)
+            if color_data:
+                return generate_analogous_colors(color_data[0][0], max(70, color_data[0][1]), 4)
+            return generate_analogous_colors(220, 70, 4)
 
-        return sorted(color_data, key=lambda x: x[0])  # Sort by hue
+        return sorted(color_data, key=lambda x: x[0])
     except Exception as e:
         print(f"Error extracting colors: {e}", file=sys.stderr)
-        return generate_analogous_colors(220, 70, 4)  # Fallback
+        return generate_analogous_colors(220, 70, 4)
 
 
 def list_app_windows(app_name="Google Chrome"):
@@ -878,27 +834,51 @@ class MovieMapper(ColorMapper):
 
 
 class BulbController:
-    """Controls Kasa smart bulbs."""
+    """Controls Kasa smart bulbs with auto-discovery support."""
 
-    def __init__(self, ips: dict):
-        self.ips = ips
+    def __init__(self, ips: dict = None):
+        self.ips = ips or {}
         self.bulbs = {}
         self.last_hsv = {}
 
-    async def connect(self):
-        print("Connecting to bulbs...")
-        for name, ip in self.ips.items():
-            try:
-                bulb = await Discover.discover_single(ip)
-                await bulb.update()
-                self.bulbs[name] = bulb
-                self.last_hsv[name] = (-999, -999, -999)  # Force first update
-                print(f"Connected to {name}: {bulb.alias} at {ip}")
-            except Exception as e:
-                print(f"Failed to connect to {name} at {ip}: {e}")
+    async def discover(self, timeout=5):
+        """Auto-discover Kasa lights on the network."""
+        print(f"Discovering lights on the network (timeout={timeout}s)...")
+        devices = await Discover.discover(timeout=timeout)
+        for ip, dev in devices.items():
+            await dev.update()
+            if Module.Light in dev.modules:
+                name = dev.alias or str(ip)
+                self.bulbs[name] = dev
+                self.last_hsv[name] = (-999, -999, -999)
+                print(f"  Found light: {name} at {ip}")
 
         if not self.bulbs:
-            raise RuntimeError("No bulbs connected!")
+            print("No lights found via auto-discovery.")
+        else:
+            print(f"Discovered {len(self.bulbs)} light(s).")
+        return len(self.bulbs)
+
+    async def connect(self):
+        """Connect to bulbs by IP (from BULBS env var). Falls back to auto-discovery."""
+        if self.ips:
+            print("Connecting to bulbs...")
+            for name, ip in self.ips.items():
+                try:
+                    bulb = await Discover.discover_single(ip)
+                    await bulb.update()
+                    self.bulbs[name] = bulb
+                    self.last_hsv[name] = (-999, -999, -999)
+                    print(f"  Connected to {name}: {bulb.alias} at {ip}")
+                except Exception as e:
+                    print(f"  Failed to connect to {name} at {ip}: {e}")
+
+        # Auto-discover if no bulbs connected yet
+        if not self.bulbs:
+            await self.discover()
+
+        if not self.bulbs:
+            raise RuntimeError("No bulbs connected! Make sure your Kasa lights are on the network.")
 
     async def disconnect(self):
         """Properly close all bulb connections."""
@@ -1324,50 +1304,34 @@ class ConsoleCompleter:
 
 
 def setup_readline_completion():
-    """Set up tab completion for console mode. Returns the completer and readline type."""
+    """Set up tab completion for console mode."""
     completer = ConsoleCompleter()
+    is_libedit = readline.__doc__ and 'libedit' in readline.__doc__
 
-    # Detect readline type
-    is_gnureadline = 'gnureadline' in sys.modules
-    is_libedit = not is_gnureadline and readline.__doc__ and 'libedit' in readline.__doc__
-
-    # Set completer
     readline.set_completer(completer.complete)
     readline.set_completer_delims(" \t\n")
 
     if is_libedit:
-        # macOS libedit - these bindings should work
         readline.parse_and_bind("bind ^I rl_complete")
     else:
-        # GNU readline (including gnureadline)
         readline.parse_and_bind("tab: complete")
-        readline.parse_and_bind("set show-all-if-ambiguous on")
 
-    return completer, is_libedit, is_gnureadline
+    return completer, is_libedit
 
 
 def console_input(prompt, completer, is_libedit):
     """Get input with readline completion support."""
-    # Re-apply completer settings before each input
     readline.set_completer(completer.complete)
     readline.set_completer_delims(" \t\n")
-
-    if is_libedit:
-        readline.parse_and_bind("bind ^I rl_complete")
-    else:
-        readline.parse_and_bind("tab: complete")
-
     return input(prompt)
 
 
 async def run_console(controller, default_device=None):
     """Interactive console mode - connect once, run multiple commands."""
     # Set up readline for command history and tab completion
-    completer, is_libedit, is_gnureadline = setup_readline_completion()
+    completer, is_libedit = setup_readline_completion()
 
     print("\nConsole mode - type commands to control lights")
-    if is_libedit and not is_gnureadline:
-        print("(Tab completion may be limited. Install gnureadline for better support: pip install gnureadline)")
     print("=" * 50)
     print("Commands:")
     print("  reactive [complementary] [device N] [sens X]  - Full spectrum mode")
@@ -1856,7 +1820,6 @@ Environment:
         default=100,
         help="Maximum brightness limit (1-100, default=100). Useful when roommate is sleeping!",
     )
-    argcomplete.autocomplete(parser)
     args = parser.parse_args()
 
     if args.list_devices:
@@ -1883,11 +1846,7 @@ Environment:
     if args.off:
         print("DJ Lights - Turning off")
         print("=" * 50)
-        bulb_ips = parse_bulbs_env()
-        if not bulb_ips:
-            print("\nNo bulbs configured. Set BULBS environment variable.")
-            return
-        controller = BulbController(bulb_ips)
+        controller = BulbController(parse_bulbs_env())
         await controller.connect()
         await controller.turn_off_all()
         await controller.disconnect()
@@ -1896,13 +1855,12 @@ Environment:
     print("DJ Lights - Real-time music visualization")
     print("=" * 50)
 
-    # Parse bulbs from environment
+    # Use BULBS env var if set, otherwise auto-discover
     bulb_ips = parse_bulbs_env()
-    if not bulb_ips:
-        print("\nNo bulbs configured. Set BULBS environment variable.")
-        return
-
-    print(f"Bulbs: {bulb_ips}")
+    if bulb_ips:
+        print(f"Bulbs from env: {bulb_ips}")
+    else:
+        print("No BULBS env var set — will auto-discover lights on the network.")
 
     # Validate max brightness
     max_brightness = max(1, min(100, args.max_brightness))

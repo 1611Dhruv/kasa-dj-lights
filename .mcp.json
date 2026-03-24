@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "apple-music": {
+      "command": "/Users/ddesai/dj_lights/venv/bin/python3",
+      "args": ["music_mcp_server.py"]
+    },
+    "dj-lights": {
+      "command": "/Users/ddesai/dj_lights/venv/bin/python3",
+      "args": ["lights_mcp_server.py"]
+    }
+  }
+}
