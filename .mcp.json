@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "dj-lights": {
+      "command": "/Users/ddesai/dj_lights/venv/bin/python3",
+      "args": ["/Users/ddesai/dj_lights/dj_lights_mcp.py"]
+    }
+  }
+}
